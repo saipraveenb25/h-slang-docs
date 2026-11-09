@@ -1,0 +1,135 @@
+name: Deploy h-slang docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit in shader-slang/slang
+        required: true
+        default: h-slang
+        type: string
+  repository_dispatch:
+    types: [deploy-docs]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Check out documentation sources and browser assets
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: shader-slang/slang
+          ref: ${{ inputs.source_ref || github.event.client_payload.source_ref || 'h-slang' }}
+          path: source
+          lfs: true
+          submodules: false
+          persist-credentials: false
+
+      - name: Record source revision
+        id: source
+        working-directory: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Read Pages configuration
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Configure the published site URL
+        env:
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          site_url = os.environ["PAGES_BASE_URL"].rstrip("/") + "/"
+          Path("source/mkdocs-pages.yml").write_text(
+              "INHERIT: mkdocs.yml\nsite_url: " + json.dumps(site_url) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Test and build documentation with the packaged browser runtime
+        env:
+          HSLANG_DOCS_RUNTIME_DIR: javascript/docs-runtime
+          HSLANG_DOCS_REQUIRE_RUNTIME: "1"
+          HSLANG_DOCS_SOURCE_URL: https://github.com/shader-slang/slang/blob/${{ steps.source.outputs.sha }}/
+        run: |
+          mkdir -p _site
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env HSLANG_DOCS_RUNTIME_DIR \
+            --env HSLANG_DOCS_REQUIRE_RUNTIME \
+            --env HSLANG_DOCS_SOURCE_URL \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace/source \
+            --entrypoint sh \
+            squidfunk/mkdocs-material:9.6.23 -ec '
+              python -m unittest discover -s extras/tests -p "test_docs_*.py"
+              python -m mkdocs build --strict --config-file mkdocs-pages.yml --site-dir /workspace/_site
+            '
+          test -s _site/index.html
+          test -s _site/assets/runtime-manifest.json
+          test -s _site/assets/slangvm/wasm/slangvm-wasm.wasm
+          test -s _site/assets/slangd/slang-wasm.wasm
+          test -s _site/assets/editor/editor.worker.js
+          test -s _site/assets/editor/language.worker.js
+
+      - name: Record deployment provenance
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source_sha = os.environ["SOURCE_SHA"]
+          source_url = "https://github.com/shader-slang/slang/commit/" + source_sha
+          Path("_site/deployment.json").write_text(json.dumps({
+              "source_repository": "shader-slang/slang",
+              "source_sha": source_sha,
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "run_url": f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{os.environ["GITHUB_RUN_ID"]}',
+          }, indent=2) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"Built [Slang {source_sha[:12]}]({source_url}).\n\n")
+              summary.write(f'Pages URL: {os.environ["PAGES_BASE_URL"]}/\n')
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
